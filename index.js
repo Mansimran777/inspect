@@ -14,7 +14,7 @@ const winston = require('winston'),
     InspectURL = require('./lib/inspect_url'),
     botController = new (require('./lib/bot_controller'))(),
     CONFIG = require(args.config),
-    postgres = new (require('./lib/postgres'))(CONFIG.database_url, CONFIG.enable_bulk_inserts),
+    mongodb = new (require('./lib/mongodb'))(CONFIG.database_url, CONFIG.enable_bulk_inserts),
     gameData = new (require('./lib/game_data'))(CONFIG.game_files_update_interval, CONFIG.enable_game_file_updates),
     errors = require('./errors'),
     Job = require('./lib/job');
@@ -52,7 +52,11 @@ for (let [i, loginData] of CONFIG.logins.entries()) {
     botController.addBot(loginData, settings);
 }
 
-postgres.connect();
+// Connect to MongoDB
+mongodb.connect().catch(err => {
+    winston.error('Failed to connect to MongoDB:', err);
+    process.exit(1);
+});
 
 // Setup and configure express
 const app = require('express')();
@@ -73,7 +77,6 @@ app.use(function (error, req, res, next) {
     else next();
 });
 
-
 if (CONFIG.trust_proxy === true) {
     app.enable('trust proxy');
 }
@@ -82,15 +85,14 @@ CONFIG.allowed_regex_origins = CONFIG.allowed_regex_origins || [];
 CONFIG.allowed_origins = CONFIG.allowed_origins || [];
 const allowedRegexOrigins = CONFIG.allowed_regex_origins.map((origin) => new RegExp(origin));
 
-
 async function handleJob(job) {
     // See which items have already been cached
-    const itemData = await postgres.getItemData(job.getRemainingLinks().map(e => e.link));
+    const itemData = await mongodb.getItemData(job.getRemainingLinks().map(e => e.link));
     for (let item of itemData) {
         const link = job.getLink(item.a);
 
         if (!item.price && link.price) {
-            postgres.updateItemPrice(item.a, link.price);
+            mongodb.updateItemPrice(item.a, link.price);
         }
 
         gameData.addAdditionalItemProperties(item);
@@ -203,7 +205,7 @@ app.post('/bulk', (req, res) => {
         let price;
 
         if (canSubmitPrice(req.body.priceKey, link, data.price)) {
-            price = parseInt(req.query.price);
+            price = parseInt(data.price);
         }
 
         job.add(link, price);
@@ -239,10 +241,10 @@ queue.process(CONFIG.logins.length, botController, async (job) => {
     delete itemData.delay;
 
     // add the item info to the DB
-    await postgres.insertItemData(itemData.iteminfo, job.data.price);
+    await mongodb.insertItemData(itemData.iteminfo, job.data.price);
 
     // Get rank, annotate with game files
-    itemData.iteminfo = Object.assign(itemData.iteminfo, await postgres.getItemRank(itemData.iteminfo.a));
+    itemData.iteminfo = Object.assign(itemData.iteminfo, await mongodb.getItemRank(itemData.iteminfo.a));
     gameData.addAdditionalItemProperties(itemData.iteminfo);
 
     itemData.iteminfo = utils.removeNullValues(itemData.iteminfo);
@@ -258,4 +260,24 @@ queue.on('job failed', (job, err) => {
     winston.warn(`Job Failed! S: ${params.s} A: ${params.a} D: ${params.d} M: ${params.m} IP: ${job.ip}, Err: ${(err || '').toString()}`);
 
     job.data.job.setResponse(params.a, errors.TTLExceeded);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+    winston.info('Shutting down...');
+    
+    try {
+        // Close MongoDB connection
+        await mongodb.close();
+        winston.info('Closed MongoDB connection');
+        
+        // Close HTTP server
+        http_server.close(() => {
+            winston.info('Closed HTTP server');
+            process.exit(0);
+        });
+    } catch (err) {
+        winston.error('Error during shutdown:', err);
+        process.exit(1);
+    }
 });
